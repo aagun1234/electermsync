@@ -3,3 +3,7 @@ jwt_users: "root"
 file_store_path: "/root/elecdata"
 host: "0.0.0.0"
 port: "7837"
+acl_whitelist:
+  - "127.0.0.1"
+  - "192.168.1.*"
+  - "192.168.99.0/24"

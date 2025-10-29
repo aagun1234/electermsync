@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,11 +18,12 @@ import (
 
 // 新增配置结构体
 type Config struct {
-	JWTSecret     string `yaml:"jwt_secret"`
-	JWTUsers      string `yaml:"jwt_users"`
-	FileStorePath string `yaml:"file_store_path"`
-	Host          string `yaml:"host"`
-	Port          string `yaml:"port"`
+	JWTSecret     string   `yaml:"jwt_secret"`
+	JWTUsers      string   `yaml:"jwt_users"`
+	FileStorePath string   `yaml:"file_store_path"`
+	Host          string   `yaml:"host"`
+	Port          string   `yaml:"port"`
+	ACLWhitelist  []string `yaml:"acl_whitelist"`
 }
 
 var (
@@ -29,10 +31,6 @@ var (
 	config     Config
 	fileDir    string
 )
-
-func init() {
-	// 解析命令行参数，默认配置文件路径为config.yaml
-}
 
 func write(data interface{}, userID string) (string, int) {
 	jsonBody, err := json.Marshal(data)
@@ -70,12 +68,12 @@ func read(userID string) (interface{}, int) {
 }
 
 func main() {
-	flag.StringVar(&configPath, "config", "config.yaml", "指定YAML配置文件路径")
-	flag.StringVar(&configPath, "c", "config.yaml", "指定YAML配置文件路径")
+	flag.StringVar(&configPath, "config", "config.yaml", "config file path")
+	flag.StringVar(&configPath, "c", "config.yaml", "config file path")
 	flag.Parse()
 
 	if configPath == "" {
-		log.Fatalf("指定配置文件")
+		log.Fatalf("config file path not specified")
 	}
 	// 加载环境变量（ fallback 用 ）
 	godotenv.Load()
@@ -84,10 +82,10 @@ func main() {
 	yamlFile, err := os.ReadFile(configPath)
 	if err == nil {
 		if err := yaml.Unmarshal(yamlFile, &config); err != nil {
-			log.Fatalf("YAML配置解析失败: %v", err)
+			log.Fatalf("YAML config parse failed: %v", err)
 		}
 	} else {
-		log.Printf("配置文件%s不存在, 读取环境变量", configPath)
+		log.Printf("config file %s not found, fallback to env", configPath)
 		// 回退到环境变量
 		config = Config{
 			JWTSecret:     os.Getenv("JWT_SECRET"),
@@ -100,7 +98,7 @@ func main() {
 
 	// 校验必填配置
 	if config.JWTSecret == "" {
-		log.Fatal("JWT_SECRET未在配置文件或环境变量中设置")
+		log.Fatal("JWT_SECRET not configed")
 	}
 
 	// 设置文件存储路径
@@ -110,7 +108,108 @@ func main() {
 	router := gin.New()
 	router.Use(gin.Recovery()) // 保留崩溃恢复中间件
 
-	// 自定义详细日志中间件
+	// IP匹配函数
+	isIPAllowed := func(clientIP string, whitelist []string) bool {
+		if len(whitelist) == 0 {
+			return true // 如果没有配置白名单，允许所有访问
+		}
+
+		for _, pattern := range whitelist {
+			// 检查精确匹配
+			if pattern == clientIP {
+				return true
+			}
+
+			// 检查CIDR表示法 (如 0.0.0.0/0)
+			if strings.Contains(pattern, "/") {
+				// 对于0.0.0.0/0，允许所有IP
+				if pattern == "0.0.0.0/0" {
+					return true
+				}
+
+				// 完整的CIDR匹配逻辑
+				parts := strings.Split(pattern, "/")
+				if len(parts) != 2 {
+					continue
+				}
+
+				cidrIP := parts[0]
+				cidrMask := parts[1]
+
+				// 将IP地址转换为32位整数
+				ipToInt := func(ip string) uint32 {
+					parts := strings.Split(ip, ".")
+					if len(parts) != 4 {
+						return 0
+					}
+					var result uint32
+					for i := 0; i < 4; i++ {
+						var part uint32
+						fmt.Sscanf(parts[i], "%d", &part)
+						result = result<<8 | part
+					}
+					return result
+				}
+
+				cidrIPInt := ipToInt(cidrIP)
+				clientIPInt := ipToInt(clientIP)
+
+				// 计算子网掩码
+				var mask uint32
+				fmt.Sscanf(cidrMask, "%d", &mask)
+				if mask > 32 {
+					continue
+				}
+
+				// 创建子网掩码
+				var subnetMask uint32 = (1 << 32) - 1
+				subnetMask = subnetMask << (32 - mask)
+
+				// 检查IP是否在CIDR范围内
+				if (cidrIPInt & subnetMask) == (clientIPInt & subnetMask) {
+					return true
+				}
+			}
+
+			// 检查通配符匹配 (如 192.168.1.*)
+			if strings.Contains(pattern, "*") {
+				patternParts := strings.Split(pattern, ".")
+				ipParts := strings.Split(clientIP, ".")
+
+				if len(patternParts) != 4 || len(ipParts) != 4 {
+					continue
+				}
+
+				match := true
+				for i := 0; i < 4; i++ {
+					if patternParts[i] != "*" && patternParts[i] != ipParts[i] {
+						match = false
+						break
+					}
+				}
+				if match {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	router.Use(func(c *gin.Context) {
+		clientIP := c.ClientIP()
+
+		if !isIPAllowed(clientIP, config.ACLWhitelist) {
+			log.Printf("Access denied for IP: %s", clientIP)
+			c.JSON(403, gin.H{"status": "error", "message": "Access denied"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	})
+
+	// 详细日志中间件
 	router.Use(func(c *gin.Context) {
 		start := time.Now()
 		path := c.Request.URL.Path
@@ -124,18 +223,31 @@ func main() {
 		statusCode := c.Writer.Status()
 		userID := c.GetString("userID")
 		errorMsg := c.Errors.ByType(gin.ErrorTypePrivate).String()
+		if errorMsg == "" {
 
-		log.Printf(
-			"[REQUEST] %s | %s | %s | %d | %s | UserID: %s | Error: %s",
-			time.Now().Format("2006-01-02 15:04:05"),
-			clientIP,
-			method,
-			path,
-			statusCode,
-			latency,
-			userID,
-			errorMsg,
-		)
+			log.Printf(
+				"[REQUEST] %s | %s | %s | %s | %d | %s | UserID: %s ",
+				time.Now().Format("2006-01-02 15:04:05"),
+				clientIP,
+				method,
+				path,
+				statusCode,
+				latency,
+				userID,
+			)
+		} else {
+			log.Printf(
+				"[REQUEST] %s | %s | %s | %s | %d | %s | UserID: %s | Error: %s",
+				time.Now().Format("2006-01-02 15:04:05"),
+				clientIP,
+				method,
+				path,
+				statusCode,
+				latency,
+				userID,
+				errorMsg,
+			)
+		}
 	})
 
 	// JWT中间件
@@ -144,6 +256,10 @@ func main() {
 		if tokenString == "" {
 			c.JSON(401, gin.H{"status": "error", "message": "Unauthorized!"})
 			c.Abort()
+			log.Printf(
+				"[JWT] %s Invalid token ",
+				time.Now().Format("2006-01-02 15:04:05"),
+			)
 			return
 		}
 
@@ -159,6 +275,11 @@ func main() {
 		if err != nil || !token.Valid {
 			c.JSON(401, gin.H{"status": "error", "message": "Unauthorized!"})
 			c.Abort()
+			log.Printf(
+				"[JWT] %s Invalid token %s",
+				time.Now().Format("2006-01-02 15:04:05"),
+				tokenString,
+			)
 			return
 		}
 
@@ -169,6 +290,11 @@ func main() {
 			} else {
 				c.JSON(401, gin.H{"status": "error", "message": "Invalid token!"})
 				c.Abort()
+				log.Printf(
+					"[JWT] %s Invalid token %s",
+					time.Now().Format("2006-01-02 15:04:05"),
+					tokenString,
+				)
 				return
 			}
 		}
@@ -200,7 +326,7 @@ func main() {
 
 	// 路由定义
 	router.GET("/test", func(c *gin.Context) {
-		c.String(200, "ok")
+		c.String(200, "GET ok")
 	})
 
 	// API路由组
@@ -232,8 +358,8 @@ func main() {
 			c.String(status, result)
 		})
 
-		api.POST("/sync", func(c *gin.Context) {
-			c.String(200, "test ok")
+		api.POST("/test", func(c *gin.Context) {
+			c.String(200, "POST ok")
 		})
 	}
 

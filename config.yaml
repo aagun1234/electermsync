@@ -1,0 +1,5 @@
+jwt_secret: "mysectet2025"
+jwt_users: "root"
+file_store_path: "/root/elecdata"
+host: "0.0.0.0"
+port: "7837"

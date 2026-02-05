@@ -3,8 +3,9 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
+	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,14 +17,42 @@ import (
 	"github.com/joho/godotenv"
 )
 
+const (
+	LogLevelDebug = "debug"
+	LogLevelInfo  = "info"
+	LogLevelError = "error"
+)
+
+func getLogLevelPriority(level string) int {
+	switch strings.ToLower(level) {
+	case LogLevelDebug:
+		return 0
+	case LogLevelInfo:
+		return 1
+	case LogLevelError:
+		return 2
+	default:
+		return 1 // Default to Info
+	}
+}
+
+func logWithLevel(level string, format string, v ...interface{}) {
+	if getLogLevelPriority(level) >= getLogLevelPriority(config.LogLevel) {
+		log.Printf("["+strings.ToUpper(level)+"] "+format, v...)
+	}
+}
+
 // 新增配置结构体
 type Config struct {
 	JWTSecret     string   `yaml:"jwt_secret"`
 	JWTUsers      string   `yaml:"jwt_users"`
 	FileStorePath string   `yaml:"file_store_path"`
-	Host          string   `yaml:"host"`
-	Port          string   `yaml:"port"`
+	Listen        string   `yaml:"listen"`
 	ACLWhitelist  []string `yaml:"acl_whitelist"`
+	SSLCert       string   `yaml:"ssl_cert"`
+	SSLKey        string   `yaml:"ssl_key"`
+	LogLevel      string   `yaml:"log_level"`
+	LogPath       string   `yaml:"log_path"`
 }
 
 var (
@@ -85,16 +114,47 @@ func main() {
 			log.Fatalf("YAML config parse failed: %v", err)
 		}
 	} else {
-		log.Printf("config file %s not found, fallback to env", configPath)
+		logWithLevel(LogLevelInfo, "config file %s not found, fallback to env", configPath)
 		// 回退到环境变量
 		config = Config{
 			JWTSecret:     os.Getenv("JWT_SECRET"),
 			JWTUsers:      os.Getenv("JWT_USERS"),
 			FileStorePath: os.Getenv("FILE_STORE_PATH"),
-			Host:          os.Getenv("HOST"),
-			Port:          os.Getenv("PORT"),
+			Listen:        os.Getenv("LISTEN"),
+			SSLCert:       os.Getenv("SSL_CERT"),
+			SSLKey:        os.Getenv("SSL_KEY"),
+			LogLevel:      os.Getenv("LOG_LEVEL"),
+			LogPath:       os.Getenv("LOG_PATH"),
 		}
 	}
+
+	// 设置默认监听地址
+	if config.Listen == "" {
+		config.Listen = "0.0.0.0:8080"
+	}
+
+	// 设置默认日志等级
+	if config.LogLevel == "" {
+		config.LogLevel = LogLevelInfo
+	}
+
+	// 初始化日志输出
+	var logWriters []io.Writer
+	logWriters = append(logWriters, os.Stdout)
+
+	if config.LogPath != "" {
+		logFile, err := os.OpenFile(config.LogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			log.Fatalf("Failed to open log file: %v", err)
+		}
+		logWriters = append(logWriters, logFile)
+	}
+
+	multiWriter := io.MultiWriter(logWriters...)
+	log.SetOutput(multiWriter)
+
+	// 设置Gin日志输出
+	gin.DefaultWriter = multiWriter
 
 	// 校验必填配置
 	if config.JWTSecret == "" {
@@ -109,87 +169,53 @@ func main() {
 	router.Use(gin.Recovery()) // 保留崩溃恢复中间件
 
 	// IP匹配函数
-	isIPAllowed := func(clientIP string, whitelist []string) bool {
+	isIPAllowed := func(clientIPStr string, whitelist []string) bool {
 		if len(whitelist) == 0 {
 			return true // 如果没有配置白名单，允许所有访问
 		}
 
+		clientIP := net.ParseIP(clientIPStr)
+		if clientIP == nil {
+			return false
+		}
+
 		for _, pattern := range whitelist {
-			// 检查精确匹配
-			if pattern == clientIP {
-				return true
+			// 1. 处理精确匹配
+			patternIP := net.ParseIP(pattern)
+			if patternIP != nil {
+				if patternIP.Equal(clientIP) {
+					return true
+				}
+				continue
 			}
 
-			// 检查CIDR表示法 (如 0.0.0.0/0)
+			// 2. 处理 CIDR (包括 0.0.0.0/0, ::/0)
 			if strings.Contains(pattern, "/") {
-				// 对于0.0.0.0/0，允许所有IP
-				if pattern == "0.0.0.0/0" {
+				_, ipNet, err := net.ParseCIDR(pattern)
+				if err == nil && ipNet.Contains(clientIP) {
 					return true
 				}
-
-				// 完整的CIDR匹配逻辑
-				parts := strings.Split(pattern, "/")
-				if len(parts) != 2 {
-					continue
-				}
-
-				cidrIP := parts[0]
-				cidrMask := parts[1]
-
-				// 将IP地址转换为32位整数
-				ipToInt := func(ip string) uint32 {
-					parts := strings.Split(ip, ".")
-					if len(parts) != 4 {
-						return 0
-					}
-					var result uint32
-					for i := 0; i < 4; i++ {
-						var part uint32
-						fmt.Sscanf(parts[i], "%d", &part)
-						result = result<<8 | part
-					}
-					return result
-				}
-
-				cidrIPInt := ipToInt(cidrIP)
-				clientIPInt := ipToInt(clientIP)
-
-				// 计算子网掩码
-				var mask uint32
-				fmt.Sscanf(cidrMask, "%d", &mask)
-				if mask > 32 {
-					continue
-				}
-
-				// 创建子网掩码
-				var subnetMask uint32 = (1 << 32) - 1
-				subnetMask = subnetMask << (32 - mask)
-
-				// 检查IP是否在CIDR范围内
-				if (cidrIPInt & subnetMask) == (clientIPInt & subnetMask) {
-					return true
-				}
+				continue
 			}
 
-			// 检查通配符匹配 (如 192.168.1.*)
+			// 3. 处理通配符 (如 192.168.1.*) - 仅限 IPv4
 			if strings.Contains(pattern, "*") {
 				patternParts := strings.Split(pattern, ".")
-				ipParts := strings.Split(clientIP, ".")
+				ipParts := strings.Split(clientIPStr, ".")
 
-				if len(patternParts) != 4 || len(ipParts) != 4 {
-					continue
-				}
-
-				match := true
-				for i := 0; i < 4; i++ {
-					if patternParts[i] != "*" && patternParts[i] != ipParts[i] {
-						match = false
-						break
+				if len(patternParts) == 4 && len(ipParts) == 4 {
+					match := true
+					for i := 0; i < 4; i++ {
+						if patternParts[i] != "*" && patternParts[i] != ipParts[i] {
+							match = false
+							break
+						}
+					}
+					if match {
+						return true
 					}
 				}
-				if match {
-					return true
-				}
+				continue
 			}
 		}
 
@@ -200,7 +226,7 @@ func main() {
 		clientIP := c.ClientIP()
 
 		if !isIPAllowed(clientIP, config.ACLWhitelist) {
-			log.Printf("Access denied for IP: %s", clientIP)
+			logWithLevel(LogLevelError, "Access denied for IP: %s", clientIP)
 			c.JSON(403, gin.H{"status": "error", "message": "Access denied"})
 			c.Abort()
 			return
@@ -225,7 +251,8 @@ func main() {
 		errorMsg := c.Errors.ByType(gin.ErrorTypePrivate).String()
 		if errorMsg == "" {
 
-			log.Printf(
+			logWithLevel(
+				LogLevelInfo,
 				"[REQUEST] %s | %s | %s | %s | %d | %s | UserID: %s ",
 				time.Now().Format("2006-01-02 15:04:05"),
 				clientIP,
@@ -236,7 +263,8 @@ func main() {
 				userID,
 			)
 		} else {
-			log.Printf(
+			logWithLevel(
+				LogLevelError,
 				"[REQUEST] %s | %s | %s | %s | %d | %s | UserID: %s | Error: %s",
 				time.Now().Format("2006-01-02 15:04:05"),
 				clientIP,
@@ -256,7 +284,8 @@ func main() {
 		if tokenString == "" {
 			c.JSON(401, gin.H{"status": "error", "message": "Unauthorized!"})
 			c.Abort()
-			log.Printf(
+			logWithLevel(
+				LogLevelError,
 				"[JWT] %s Invalid token ",
 				time.Now().Format("2006-01-02 15:04:05"),
 			)
@@ -275,7 +304,8 @@ func main() {
 		if err != nil || !token.Valid {
 			c.JSON(401, gin.H{"status": "error", "message": "Unauthorized!"})
 			c.Abort()
-			log.Printf(
+			logWithLevel(
+				LogLevelError,
 				"[JWT] %s Invalid token %s",
 				time.Now().Format("2006-01-02 15:04:05"),
 				tokenString,
@@ -290,7 +320,8 @@ func main() {
 			} else {
 				c.JSON(401, gin.H{"status": "error", "message": "Invalid token!"})
 				c.Abort()
-				log.Printf(
+				logWithLevel(
+					LogLevelError,
 					"[JWT] %s Invalid token %s",
 					time.Now().Format("2006-01-02 15:04:05"),
 					tokenString,
@@ -364,5 +395,15 @@ func main() {
 	}
 
 	// 启动服务器
-	router.Run(config.Host + ":" + config.Port) // 使用配置中的地址
+	if config.SSLCert != "" && config.SSLKey != "" {
+		logWithLevel(LogLevelInfo, "Starting HTTPS server on %s", config.Listen)
+		if err := router.RunTLS(config.Listen, config.SSLCert, config.SSLKey); err != nil {
+			log.Fatalf("Failed to start HTTPS server: %v", err)
+		}
+	} else {
+		logWithLevel(LogLevelInfo, "Starting HTTP server on %s", config.Listen)
+		if err := router.Run(config.Listen); err != nil {
+			log.Fatalf("Failed to start HTTP server: %v", err)
+		}
+	}
 }
